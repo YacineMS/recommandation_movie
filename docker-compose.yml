@@ -1,0 +1,210 @@
+services:
+  movie_mlflow:
+    build:
+      context: ./mlflow
+    container_name: mlflow
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./models:/app/models
+      - ./shared:/app/shared
+      - ./mlflow_data:/mlflow
+    networks:
+      - mlflow-net
+    environment:
+      - MLFLOW_SERVER_ALLOWED_HOSTS=*
+      - MLFLOW_ENABLE_XFRAME_HEADERS=false
+    env_file:
+      - .env
+    command: >
+      mlflow server
+      --backend-store-uri=sqlite:////mlflow/mlflow.db
+      --default-artifact-root=/app/models
+      --host=0.0.0.0
+      --port=5000
+      --allowed-hosts=*
+
+
+  movie_trainer_api:
+    build:
+      context: ./trainer
+    container_name: trainer_api
+    ports:
+      - "8003:8000"
+    depends_on:
+      - movie_mlflow
+    networks:
+      - mlflow-net
+    volumes:
+      - ./models:/app/models
+      - ./shared:/app/shared
+    env_file:
+      - .env
+      
+  movie_predicter_api:
+    build:
+      context: ./predicter
+    container_name: predicter
+    ports:
+      - "8001:8000"
+    depends_on:
+      - movie_mlflow
+    networks:
+      - mlflow-net
+    volumes:
+      - ./models:/app/models
+      - ./shared:/app/shared
+    env_file:
+      - .env
+
+  knn_api:
+    build:
+      context: ./knn_api
+      dockerfile: Dockerfile
+    container_name: knn-api
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./models:/app/models
+      - ./shared:/app/shared
+    networks:
+      - mlflow-net
+    depends_on:
+      - movie_mlflow
+    restart: unless-stopped
+
+  streamlit-ui:
+    build: ./streamlit-ui
+    container_name: recofilm-ui
+    ports:
+      - "8501:8501"
+    environment:
+      - KNN_API_URL=http://knn_api:8002/predict
+      - SVD_API_URL=http://movie_trainer_api:8000/predict
+      - SERVICE_TOKEN=knn-to-svd-secret
+    networks:
+      - mlflow-net
+    depends_on:
+      - knn_api
+      - movie_predicter_api
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: recofilm-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - mlflow-net
+    depends_on:
+      - knn_api
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: recofilm-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - mlflow-net
+    depends_on:
+      - prometheus
+      - knn_api
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    container_name: airflow_postgres
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    networks:
+      - mlflow-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  airflow-init:
+    build: ./airflow
+    container_name: airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlflow-net
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: 8_EYDuReIm74yW2YANWItYyx7o92Sbgwe-c_Fj1tLu4=
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      airflow db migrate || true
+      "
+    restart: "no"
+
+  airflow:
+    build: ./airflow
+    container_name: airflow
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      movie_trainer_api: 
+        condition: service_started
+      knn_api: 
+        condition: service_started
+    
+    networks:
+      - mlflow-net
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: 8_EYDuReIm74yW2YANWItYyx7o92Sbgwe-c_Fj1tLu4=
+      AIRFLOW__API_AUTH__JWT_SECRET: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2g3h4i5j6k7l8m9n0o1p2q3r4s5t6u7v8w9x0y1z2
+      AIRFLOW__API__BASE_URL: http://localhost:8080
+      AIRFLOW__SDK__API_URL: http://localhost:8080
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/airflow.cfg:/opt/airflow/airflow.cfg
+    command: ["airflow", "standalone"]
+    ports:
+      - "8085:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/login/ || exit 1"]
+      interval: 20s
+      retries: 5
+      start_period: 30s
+
+    
+volumes:
+  postgres-db-volume:
+  models:
+  prometheus_data: 
+  grafana_data:
+
+
+networks:
+  mlflow-net:
+    driver: bridge
